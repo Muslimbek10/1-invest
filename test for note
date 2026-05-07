@@ -1,0 +1,67 @@
+import pandas as pd
+
+# Load once
+df = pd.read_csv("../1-invest.csv")
+
+df["section"] = pd.to_numeric(df["section"], errors="coerce")
+df["g2"]      = pd.to_numeric(df["g2"],      errors="coerce")
+df["g12"]     = pd.to_numeric(df["g12"],     errors="coerce")
+df["g13"]     = pd.to_numeric(df["g13"],     errors="coerce")
+df["g17"]     = pd.to_numeric(df["g17"],     errors="coerce")
+df["g18"]     = pd.to_numeric(df["g18"],     errors="coerce")
+
+# Final column order
+FINAL_COLS = ["davr", "okpo", "razdel", "ns_name", "SOATO", "country", "OKED",
+              "ns", "ns1", "EdIzm", "g1", "g2", "g3", "g4", "g5", "g6",
+              "g7", "g8", "g9", "g10", "npah", "kurs", "ehud", "akt", "tur"]
+
+BLANK_COLS = ["davr", "ns_name", "country", "OKED", "ns1", "EdIzm",
+              "g2", "g3", "g4", "g5", "g6", "g7", "g8", "g9", "g10",
+              "npah", "kurs", "ehud", "akt", "tur"]
+
+# Each task: (section_filter, g2_filter, sum_col, ns_value, razdel_value)
+TASKS = [
+    (3, 80, "g17", 402, 4),   # t1
+    (3, 80, "g18", 403, 4),   # t2
+    (3, 51, "g13", 404, 4),   # t3
+    (3, 52, "g13", 405, 4),   # t4
+    (3, 23, "g13", 407, 4),   # t5
+    (3, 60, "g13", 408, 4),   # t6
+    (3, 73, "g13", 409, 4),   # t7
+    (3, 74, "g13", 410, 4),   # t8
+    (3, 71, "g13", 411, 4),   # t9
+    (3, 72, "g13", 412, 4),   # t10
+    (3, 79, "g13", 413, 4),   # t11
+]
+
+def process(df, section_val, g2_val, sum_col, ns_val, razdel_val):
+    filtered = df[(df["section"] == section_val) & (df["g2"] == g2_val)]
+    print(f"  section={section_val}, g2={g2_val}, sum({sum_col}): {len(filtered)} rows")
+
+    result = (
+        filtered
+        .groupby(["okpo", "g9"], as_index=False)[sum_col]
+        .sum()
+    )
+    result = result.rename(columns={"g9": "SOATO", sum_col: "g1"})
+    result["ns"]     = ns_val
+    result["razdel"] = razdel_val
+
+    for col in BLANK_COLS:
+        result[col] = ""
+
+    return result[FINAL_COLS]
+
+# Run all tasks and concatenate
+frames = []
+for i, (sec, g2, scol, ns, razdel) in enumerate(TASKS, start=1):
+    print(f"[t{i}] Processing...")
+    frames.append(process(df, sec, g2, scol, ns, razdel))
+
+final = pd.concat(frames, ignore_index=True)
+
+print(f"\nTotal rows: {len(final)}")
+print(final)
+
+final.to_csv("scr5.csv", index=False)
+print("\nSaved → final_output.csv")
