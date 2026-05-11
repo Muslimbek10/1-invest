@@ -1,0 +1,872 @@
+"""
+Yillik 1700 Combiner — CustomTkinter GUI app
+
+Runs BOTH master pipelines and concatenates their outputs into ONE Excel file.
+
+Pipeline A (test.xlsx-style flow): 7 sub-pipelines that produce the
+  25-column FINAL_COLS_A schema (with ns_name).
+
+Pipeline B (test2.xlsx-style flow): 4 master pipelines that produce the
+  24-column FINAL_COLS_B schema.
+
+Both result frames are aligned to the union of columns and stacked into
+one final Excel file with a single sheet.
+
+Inputs (chosen in the GUI):
+  - 1-fx shakli_Yillik_1700.csv          + katalog for fx.xlsx
+  - 1- nnt shakli_Yillik_1700.csv        + katalog for nnt.xlsx
+  - 1-notijorat shakli_Yillik_1700.csv
+  - 1-invest (asosiy) shakli_Yillik_1700.csv
+  - 1 korxona shakli_Yillik.csv
+
+Output:
+  - User-chosen .xlsx file (default: all_combined_final.xlsx)
+"""
+
+from __future__ import annotations
+
+import threading
+import traceback
+from pathlib import Path
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
+import numpy as np
+import pandas as pd
+
+
+# ===========================================================================
+# THEME (light colors, simple)
+# ===========================================================================
+ctk.set_appearance_mode("light")
+ctk.set_default_color_theme("blue")
+
+BG_MAIN = "#F5F7FA"
+BG_CARD = "#FFFFFF"
+TEXT_DARK = "#1F2937"
+TEXT_MUTED = "#6B7280"
+BORDER = "#E5E7EB"
+ACCENT = "#2563EB"
+ACCENT_HOVER = "#1D4ED8"
+GREEN_OK = "#059669"
+RED_ERR = "#DC2626"
+
+
+# ===========================================================================
+# SHARED HELPERS (used by both pipelines)
+# ===========================================================================
+def read_csv_safe(path: Path) -> pd.DataFrame:
+    """Read a semicolon-separated CSV, tolerating bad lines."""
+    return pd.read_csv(
+        path,
+        sep=";",
+        on_bad_lines="skip",
+        encoding="utf-8",
+        index_col=False,
+        low_memory=False,
+    )
+
+
+def smart_numeric(series: pd.Series) -> pd.Series:
+    """
+    Coerce to numeric; per cell:
+      NaN -> None, whole -> int, decimal -> float.
+    """
+    nums = pd.to_numeric(series, errors="coerce")
+
+    def to_cell(x):
+        if pd.isna(x):
+            return None
+        if float(x).is_integer():
+            return int(x)
+        return float(x)
+
+    return pd.Series([to_cell(x) for x in nums], index=nums.index, dtype=object)
+
+
+# ===========================================================================
+# PIPELINE A — 7 sub-pipelines (test.xlsx-style)
+# ===========================================================================
+FINAL_COLS_A = [
+    "davr", "okpo", "razdel", "ns_name", "SOATO", "country", "OKED",
+    "ns", "ns1", "EdIzm",
+    "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "g9", "g10",
+    "npah", "kurs", "ehud", "akt", "tur",
+]
+
+
+def pad_and_order_a(df: pd.DataFrame) -> pd.DataFrame:
+    for col in FINAL_COLS_A:
+        if col not in df.columns:
+            df[col] = None
+    return df[FINAL_COLS_A]
+
+
+# ---- step 1: 1-invest, section==3, sum g12 ----
+STEP1_BLOCKS = [
+    {"filter_values": [11],            "soato_col": "g9",    "target_ns": 301},
+    {"filter_values": [21],            "soato_col": "soato", "target_ns": 302},
+    {"filter_values": [22],            "soato_col": "soato", "target_ns": 303},
+    {"filter_values": [31, 32, 33],    "soato_col": "soato", "target_ns": 304},
+    {"filter_values": [311, 321, 331], "soato_col": "soato", "target_ns": 305},
+    {"filter_values": [31],            "soato_col": "soato", "target_ns": 306},
+    {"filter_values": [32],            "soato_col": "soato", "target_ns": 307},
+    {"filter_values": [33],            "soato_col": "soato", "target_ns": 308},
+    {"filter_values": [332],           "soato_col": "soato", "target_ns": 309},
+    {"filter_values": [23, 51, 52, 60, 71, 72, 73, 74, 79, 80],
+                                       "soato_col": "soato", "target_ns": 310},
+]
+
+
+def run_step1(df: pd.DataFrame, log) -> list[pd.DataFrame]:
+    pieces = []
+    for i, block in enumerate(STEP1_BLOCKS, start=1):
+        sub = df[df["g1"].isin(block["filter_values"])].copy()
+        if sub.empty:
+            pieces.append(pd.DataFrame(columns=FINAL_COLS_A))
+            log(f"  step1 #{i:>2}: ns={block['target_ns']} rows=0")
+            continue
+
+        grouped = sub.groupby(
+            ["okpo", "section", block["soato_col"], "g1"], as_index=False
+        )["g12"].sum()
+        grouped = grouped.rename(columns={
+            "section": "razdel",
+            block["soato_col"]: "SOATO",
+            "g1": "ns",
+            "g12": "g1",
+        })
+        grouped["ns"] = block["target_ns"]
+        grouped["ns_name"] = np.nan
+        grouped["tur"] = "1-invest"
+        out = pad_and_order_a(grouped)
+        log(f"  step1 #{i:>2}: ns={block['target_ns']} rows={len(out):,}")
+        pieces.append(out)
+    return pieces
+
+
+# ---- step 2: 1-invest, section==4, sum g6 ----
+STEP2_BLOCKS = [
+    {"name": "n1",      "g_col": "g5", "g_val": 5, "ns": 319},
+    {"name": "n2",      "g_col": "g5", "g_val": 4, "ns": 318},
+    {"name": "n3",      "g_col": "g5", "g_val": 3, "ns": 317},
+    {"name": "n4",      "g_col": "g5", "g_val": 2, "ns": 316},
+    {"name": "n5",      "g_col": "g5", "g_val": 1, "ns": 315},
+    {"name": "n6",      "g_col": "g4", "g_val": 1, "ns": 314},
+    {"name": "n_final", "g_col": None, "g_val": None, "ns": 313},
+]
+
+
+def run_step2(df: pd.DataFrame, log) -> list[pd.DataFrame]:
+    pieces = []
+    for block in STEP2_BLOCKS:
+        if block["g_col"] is None:
+            sub = df.copy()
+            keys = ["okpo", "section", "g3"]
+        else:
+            sub = df[df[block["g_col"]] == block["g_val"]].copy()
+            keys = ["okpo", "section", block["g_col"], "g3"]
+
+        if sub.empty:
+            pieces.append(pd.DataFrame(columns=FINAL_COLS_A))
+            log(f"  step2 {block['name']}: ns={block['ns']} rows=0")
+            continue
+
+        grouped = sub.groupby(keys, as_index=False).agg({"g6": "sum"})
+        rename_map = {"section": "razdel", "g3": "SOATO", "g6": "g1"}
+        if block["g_col"] is not None:
+            rename_map[block["g_col"]] = "ns"
+        result = grouped.rename(columns=rename_map)
+        result["razdel"] = result["razdel"].replace({4: 3})
+        result["ns"] = block["ns"]
+        result["tur"] = "1-invest"
+        out = pad_and_order_a(result)
+        log(f"  step2 {block['name']}: ns={block['ns']} rows={len(out):,}")
+        pieces.append(out)
+    return pieces
+
+
+# ---- step 3: 1-korxona, sum g3 ----
+STEP3_BLOCKS = [
+    {"name": "k1", "section": 5, "g1": 114, "razdel_to": 2,  "ns_to": 201},
+    {"name": "k2", "section": 5, "g1": 115, "razdel_to": 2,  "ns_to": 203},
+    {"name": "k3", "section": 9, "g1": 181, "razdel_to": 2,  "ns_to": 204},
+    {"name": "k4", "section": 9, "g1": 183, "razdel_to": 31, "ns_to": 311},
+    {"name": "k5", "section": 9, "g1": 184, "razdel_to": 31, "ns_to": 312},
+    {"name": "k6", "section": 9, "g1": 185, "razdel_to": 31, "ns_to": 313},
+    {"name": "k7", "section": 9, "g1": 186, "razdel_to": 31, "ns_to": 314},
+]
+
+
+def run_step3(df: pd.DataFrame, log) -> list[pd.DataFrame]:
+    pieces = []
+    for block in STEP3_BLOCKS:
+        sub = df[(df["section"] == block["section"]) & (df["g1"] == block["g1"])].copy()
+        if sub.empty:
+            pieces.append(pd.DataFrame(columns=FINAL_COLS_A))
+            log(f"  step3 {block['name']}: ns={block['ns_to']} rows=0")
+            continue
+        sub["SOATO"] = sub["soato"].astype(str).str[:7]
+        grouped = (sub.groupby(["okpo", "SOATO"], as_index=False)
+                       .agg({"section": "first", "g1": "first", "g3": "sum"}))
+        result = grouped.rename(columns={"section": "razdel", "g1": "ns", "g3": "g1"})
+        result["razdel"] = block["razdel_to"]
+        result["ns"] = block["ns_to"]
+        result["tur"] = "1-korxona"
+        out = pad_and_order_a(result)
+        log(f"  step3 {block['name']}: ns={block['ns_to']} rows={len(out):,}")
+        pieces.append(out)
+    return pieces
+
+
+# ---- step 4: 1-invest section==3, g9-SOATO, variable sum_col ----
+STEP4_BLOCKS = [
+    {"name": "k1",  "section": 3, "g1": 80, "razdel_to": 4, "ns_to": 402, "sum_col": "g16"},
+    {"name": "k2",  "section": 3, "g1": 80, "razdel_to": 4, "ns_to": 403, "sum_col": "g17"},
+    {"name": "k3",  "section": 3, "g1": 51, "razdel_to": 4, "ns_to": 404},
+    {"name": "k4",  "section": 3, "g1": 52, "razdel_to": 4, "ns_to": 405},
+    {"name": "k5",  "section": 3, "g1": 23, "razdel_to": 4, "ns_to": 407},
+    {"name": "k6",  "section": 3, "g1": 60, "razdel_to": 4, "ns_to": 408},
+    {"name": "k7",  "section": 3, "g1": 73, "razdel_to": 4, "ns_to": 409},
+    {"name": "k8",  "section": 3, "g1": 74, "razdel_to": 4, "ns_to": 410},
+    {"name": "k9",  "section": 3, "g1": 71, "razdel_to": 4, "ns_to": 411},
+    {"name": "k10", "section": 3, "g1": 72, "razdel_to": 4, "ns_to": 412},
+    {"name": "k11", "section": 3, "g1": 79, "razdel_to": 4, "ns_to": 413},
+]
+
+
+def run_step4(df: pd.DataFrame, log) -> list[pd.DataFrame]:
+    pieces = []
+    for block in STEP4_BLOCKS:
+        sum_col = block.get("sum_col", "g12")
+        sub = df[(df["section"] == block["section"]) & (df["g1"] == block["g1"])].copy()
+        if sub.empty:
+            pieces.append(pd.DataFrame(columns=FINAL_COLS_A))
+            log(f"  step4 {block['name']}: ns={block['ns_to']} sum={sum_col} rows=0")
+            continue
+        sub["SOATO"] = sub["g9"].astype(str).str[:7]
+        grouped = (sub.groupby(["okpo", "SOATO"], as_index=False)
+                       .agg({"section": "first", "g1": "first", sum_col: "sum"}))
+        result = grouped.rename(columns={
+            "section": "razdel", "g1": "ns", sum_col: "g1"
+        })
+        result["razdel"] = block["razdel_to"]
+        result["ns"] = block["ns_to"]
+        result["tur"] = "1-invest"
+        out = pad_and_order_a(result)
+        log(f"  step4 {block['name']}: ns={block['ns_to']} sum={sum_col} rows={len(out):,}")
+        pieces.append(out)
+    return pieces
+
+
+# ---- generic step5/6/7 runner ----
+def run_simple_blocks(df, configs, tur, label, log) -> list[pd.DataFrame]:
+    pieces = []
+    for section, g1_val, out_razdel, out_ns in configs:
+        sub = df[(df["section"] == section) & (df["g1"] == g1_val)].copy()
+        if sub.empty:
+            pieces.append(pd.DataFrame(columns=FINAL_COLS_A))
+            log(f"  {label} sec={section} g1={g1_val} ns={out_ns} rows=0")
+            continue
+        sub["SOATO"] = sub["soato"].astype(str).str[:7]
+        grouped = sub.groupby(["okpo", "SOATO"], as_index=False).agg({"g3": "sum"})
+        result = grouped.rename(columns={"g3": "g1"})
+        result["razdel"] = out_razdel
+        result["ns"] = out_ns
+        result["tur"] = tur
+        out = pad_and_order_a(result)
+        log(f"  {label} sec={section} g1={g1_val} ns={out_ns} rows={len(out):,}")
+        pieces.append(out)
+    return pieces
+
+
+STEP5_CONFIGS = [
+    (8, 405, 2, 201), (8, 406, 2, 204),
+    (8, 401, 31, 311), (8, 402, 31, 312),
+    (8, 403, 31, 313), (8, 404, 31, 314),
+]
+STEP6_CONFIGS = [
+    (8, 605, 2, 201), (9, 606, 2, 204),
+    (9, 601, 31, 311), (9, 602, 31, 312),
+    (9, 603, 31, 313), (9, 604, 31, 314),
+]
+STEP7_CONFIGS = [
+    (27, 1602, 2, 201), (27, 1603, 2, 204), (27, 1601, 31, 311),
+]
+
+
+def run_pipeline_a(paths: dict, log) -> pd.DataFrame:
+    """Pipeline A: 7-step master that produces FINAL_COLS_A."""
+    log("\n=== Pipeline A (7-step) ===")
+    all_pieces: list[pd.DataFrame] = []
+
+    # 1-invest (used by step1, step2, step4)
+    log(f"[invest] reading {paths['invest'].name}")
+    df_invest = read_csv_safe(paths["invest"])
+    log(f"  raw rows: {len(df_invest):,}")
+    for c in ["section", "g1", "g3", "g4", "g5", "g6", "g12", "g16", "g17"]:
+        if c in df_invest.columns:
+            df_invest[c] = pd.to_numeric(df_invest[c], errors="coerce")
+    df_inv_s3 = df_invest[df_invest["section"] == 3].copy()
+    df_inv_s4 = df_invest[df_invest["section"] == 4].copy()
+
+    log("[step1] invest sec==3, sum g12")
+    all_pieces.extend(run_step1(df_inv_s3, log))
+    log("[step2] invest sec==4, sum g6")
+    all_pieces.extend(run_step2(df_inv_s4, log))
+    log("[step4] invest sec==3, g9-SOATO, var sum_col")
+    all_pieces.extend(run_step4(df_inv_s3, log))
+
+    # 1-korxona (step3)
+    log(f"[korxona] reading {paths['korxona'].name}")
+    df_kor = read_csv_safe(paths["korxona"])
+    for c in ["section", "g1", "g3"]:
+        if c in df_kor.columns:
+            df_kor[c] = pd.to_numeric(df_kor[c], errors="coerce")
+    df_kor = df_kor[
+        ((df_kor["section"] == 5) & (df_kor["g1"].isin([114, 115]))) |
+        ((df_kor["section"] == 9) & (df_kor["g1"].isin([181, 183, 184, 185, 186])))
+    ].copy()
+    log("[step3] korxona, sum g3")
+    all_pieces.extend(run_step3(df_kor, log))
+
+    # 1-notijorat (step5)
+    log(f"[notijorat] reading {paths['notijorat'].name}")
+    df_not = read_csv_safe(paths["notijorat"])
+    for c in ["section", "g1", "g3"]:
+        if c in df_not.columns:
+            df_not[c] = pd.to_numeric(df_not[c], errors="coerce")
+    df_not = df_not[(df_not["section"] == 8) &
+                    (df_not["g1"].isin([401, 402, 403, 404, 405, 406]))].copy()
+    log("[step5] notijorat, sum g3")
+    all_pieces.extend(run_simple_blocks(df_not, STEP5_CONFIGS, "1-notijorat", "step5", log))
+
+    # 1-nnt (step6)
+    log(f"[nnt] reading {paths['nnt'].name}")
+    df_nnt = read_csv_safe(paths["nnt"])
+    for c in ["section", "g1", "g3"]:
+        if c in df_nnt.columns:
+            df_nnt[c] = pd.to_numeric(df_nnt[c], errors="coerce")
+    df_nnt = df_nnt[
+        ((df_nnt["section"] == 8) & (df_nnt["g1"] == 605)) |
+        ((df_nnt["section"] == 9) & (df_nnt["g1"].isin([601, 602, 603, 604, 606])))
+    ].copy()
+    log("[step6] nnt, sum g3")
+    all_pieces.extend(run_simple_blocks(df_nnt, STEP6_CONFIGS, "1-nnt", "step6", log))
+
+    # 1-fx (step7)
+    log(f"[fx] reading {paths['fx'].name}")
+    df_fx = read_csv_safe(paths["fx"])
+    for c in ["section", "g1", "g3"]:
+        if c in df_fx.columns:
+            df_fx[c] = pd.to_numeric(df_fx[c], errors="coerce")
+    df_fx = df_fx[(df_fx["section"] == 27) &
+                  (df_fx["g1"].isin([1601, 1602, 1603]))].copy()
+    log("[step7] fx, sum g3")
+    all_pieces.extend(run_simple_blocks(df_fx, STEP7_CONFIGS, "1-fx", "step7", log))
+
+    final_a = pd.concat(all_pieces, ignore_index=True)
+    final_a["g1"] = smart_numeric(final_a["g1"])
+    log(f"Pipeline A: {len(final_a):,} rows")
+    return final_a
+
+
+# ===========================================================================
+# PIPELINE B — 4 master pipelines (test2.xlsx-style)
+# ===========================================================================
+FINAL_COLS_B = [
+    "davr", "okpo", "razdel", "SOATO", "country", "OKED",
+    "ns", "ns1", "EdIzm",
+    "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "g9", "g10",
+    "npah", "kurs", "ehud", "akt", "tur",
+]
+
+GROUP_KEYS_B = [
+    "davr", "okpo", "razdel", "SOATO", "country", "OKED",
+    "ns", "ns1", "EdIzm", "g9", "g10",
+    "npah", "kurs", "ehud", "akt", "tur",
+]
+
+
+def aggregate_and_finalize(df: pd.DataFrame) -> pd.DataFrame:
+    df["condition"] = pd.to_numeric(df["condition"], errors="coerce")
+    for c in ["g1", "g2", "g3", "g4", "g5", "g6", "g8"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    mask_main = ~df["condition"].isin([311, 321, 331, 332])
+    agg_main = (df.loc[mask_main]
+                  .groupby(GROUP_KEYS_B, dropna=False, as_index=False)
+                  .agg({"g1": "sum", "g2": "sum", "g4": "sum", "g5": "sum", "g8": "sum"}))
+
+    mask_36 = df["condition"].isin([31, 32, 33])
+    agg_36 = (df.loc[mask_36]
+                .groupby(GROUP_KEYS_B, dropna=False, as_index=False)
+                .agg({"g3": "sum", "g6": "sum"}))
+
+    result = agg_main.merge(agg_36, on=GROUP_KEYS_B, how="left")
+    result["g3"] = result["g3"].fillna(0)
+    result["g6"] = result["g6"].fillna(0)
+    result.loc[result["razdel"] == 3, "razdel"] = 1
+    result["g7"] = result["g1"] - result["g2"] - result["g6"]
+    return result[FINAL_COLS_B]
+
+
+
+
+def apply_katalog_g7(df: pd.DataFrame, katalog_path: Path) -> pd.DataFrame:
+
+    sec = pd.read_excel(katalog_path)
+
+    df["inn"] = df["inn"].astype(str)
+
+    df["okpo"] = df["okpo"].astype(str)
+
+    sec["INN"] = sec["INN"].astype(str)
+
+    sec["OKPO"] = sec["OKPO"].astype(str)
+
+    df = df.merge(sec, left_on=["inn", "okpo"], right_on=["INN", "OKPO"], how="left")
+
+    for col in ["2_xona", "4_xona", "5_xona"]:
+
+        if col in df.columns:
+
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        else:
+
+            df[col] = 0
+
+    # Fallback: 2_xona -> 4_xona -> 5_xona
+
+    df["g7"] = np.where(
+
+        df["2_xona"] != 0, df["2_xona"],
+
+        np.where(df["4_xona"] != 0, df["4_xona"], df["5_xona"])
+
+    )
+
+    df["g7"] = pd.to_numeric(df["g7"], errors="coerce").fillna(0)
+
+    return df
+
+
+def build_intermediate(df: pd.DataFrame) -> pd.DataFrame:
+    df["davr"] = 12
+    df["npah"] = 1000
+    df["EdIzm"] = ""
+    df["akt"] = ""
+    df["razdel"] = df["section"]
+    df["ns_name"] = df["g3"]
+    df["SOATO"] = df["g9"]
+    df["country"] = df["g5"]
+    df["OKED"] = df["g7"]
+    df["ns"] = df["g4"]
+    df["ns1"] = df["g10"]
+    df["condition"] = df["g2"]
+    df["kurs"] = df["g11"]
+    df["ehud"] = df["soato"].astype(str).str[:4]
+
+    for c in ["g11", "g12", "g13", "g14", "g15", "g18"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df["new_g1"]  = df["g12"]
+    df["new_g2"]  = df["g13"]
+    df["new_g3"]  = df["g13"]
+    df["new_g4"]  = df["g14"]
+    df["new_g5"]  = df["g15"]
+    df["new_g6"]  = df["g12"].fillna(0) - df["g13"].fillna(0)
+    df["new_g7"]  = ""
+    df["new_g8"]  = df["g18"]
+    df["new_g9"]  = ""
+    df["new_g10"] = ""
+
+    inter = [
+        "davr", "inn", "okpo", "razdel", "ns_name", "SOATO", "country", "OKED",
+        "ns", "ns1", "EdIzm", "npah", "akt",
+        "new_g1", "new_g2", "new_g3", "new_g4", "new_g5",
+        "new_g6", "new_g7", "new_g8", "new_g9", "new_g10",
+        "kurs", "ehud", "tur", "condition",
+    ]
+    df = df[inter].copy()
+    df = df.rename(columns={f"new_g{i}": f"g{i}" for i in range(1, 11)})
+    return df
+
+
+def run_fx_b(path_csv: Path, path_kat: Path, log) -> pd.DataFrame:
+    log("[B/fx] reading...")
+    df = read_csv_safe(path_csv)
+    df["section"] = pd.to_numeric(df["section"], errors="coerce")
+    df = df[df["section"] == 26].copy()
+    df["tur"] = "1-fx"
+    df = df[["inn", "soato", "okpo", "section",
+             "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "g9", "g10", "tur"]].copy()
+    orig = df.copy()
+    df["g2"], df["g3"] = df["g3"], df["g2"]
+    df["g6"] = 0; df["g7"] = 0; df["g8"] = 0
+    df["g9"] = df["soato"].astype(str).str[:7]
+    df["g10"] = orig["g6"]; df["g11"] = orig["g7"]
+    df["g12"] = orig["g8"]; df["g13"] = orig["g9"]; df["g14"] = orig["g10"]
+    df = apply_katalog_g7(df, path_kat)
+    df.loc[df["section"] == 26, "section"] = 3
+    df["g15"] = ""; df["g16"] = ""; df["g17"] = ""; df["g18"] = ""
+    df = build_intermediate(df)
+    result = aggregate_and_finalize(df)
+    log(f"  B/fx rows: {len(result):,}")
+    return result
+
+
+def run_nnt_b(path_csv: Path, path_kat: Path, log) -> pd.DataFrame:
+    log("[B/nnt] reading...")
+    df = read_csv_safe(path_csv)
+    df["section"] = pd.to_numeric(df["section"], errors="coerce")
+    df = df[df["section"] == 8].copy()
+    df["tur"] = "1-nnt"
+    df = df[["inn", "soato", "okpo", "section",
+             "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "g9", "g10", "tur"]].copy()
+    orig = df.copy()
+    df["g2"], df["g3"] = df["g3"], df["g2"]
+    df["g6"] = 0; df["g7"] = 0; df["g8"] = 0
+    df["g9"] = df["soato"].astype(str).str[:7]
+    df["g10"] = orig["g6"]; df["g11"] = orig["g7"]
+    df["g12"] = orig["g8"]; df["g13"] = orig["g9"]; df["g14"] = orig["g10"]
+    df = apply_katalog_g7(df, path_kat)
+    df.loc[df["section"] == 8, "section"] = 3
+    df["g15"] = ""; df["g16"] = ""; df["g17"] = ""; df["g18"] = ""
+    df = build_intermediate(df)
+    result = aggregate_and_finalize(df)
+    log(f"  B/nnt rows: {len(result):,}")
+    return result
+
+
+def run_notijorat_b(path_csv: Path, log) -> pd.DataFrame:
+    log("[B/notijorat] reading...")
+    df = read_csv_safe(path_csv)
+    df["section"] = pd.to_numeric(df["section"], errors="coerce")
+    df["g4"] = pd.to_numeric(df["g4"], errors="coerce")
+    df = df[df["section"] == 7].copy()
+    df["tur"] = "1-notijorat"
+    df.loc[df["section"] == 7, "section"] = 3
+    df["g4"] = df["g4"].replace({10: 11, 11: 13})
+    df = df[["inn", "soato", "okpo", "section",
+             "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "g9", "g10",
+             "g11", "g12", "g13", "g14", "tur"]].copy()
+    df["g15"] = ""; df["g16"] = ""; df["g17"] = ""; df["g18"] = ""
+    df = build_intermediate(df)
+    result = aggregate_and_finalize(df)
+    log(f"  B/notijorat rows: {len(result):,}")
+    return result
+
+
+def run_invest_b(path_csv: Path, log) -> pd.DataFrame:
+    log("[B/invest] reading...")
+    df = read_csv_safe(path_csv)
+    df["section"] = pd.to_numeric(df["section"], errors="coerce")
+    df = df[df["section"] == 3].copy()
+    df["tur"] = "1-invest"
+    df = df[["inn", "soato", "okpo", "section",
+             "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "g9", "g10",
+             "g11", "g12", "g13", "g14", "g15", "g16", "g17", "g18", "tur"]].copy()
+    df = build_intermediate(df)
+    result = aggregate_and_finalize(df)
+
+    def _clean_kurs(x):
+        if pd.isna(x):
+            return x
+        return int(x) if float(x).is_integer() else float(x)
+
+    result["kurs"] = pd.to_numeric(result["kurs"], errors="coerce").map(_clean_kurs)
+    log(f"  B/invest rows: {len(result):,}")
+    return result
+
+
+def run_pipeline_b(paths: dict, log) -> pd.DataFrame:
+    log("\n=== Pipeline B (4-step) ===")
+    fx_df    = run_fx_b(paths["fx"], paths["fx_katalog"], log)
+    nnt_df   = run_nnt_b(paths["nnt"], paths["nnt_katalog"], log)
+    noti_df  = run_notijorat_b(paths["notijorat"], log)
+    inv_df   = run_invest_b(paths["invest"], log)
+    combined = pd.concat([fx_df, nnt_df, noti_df, inv_df], axis=0, ignore_index=True)
+    combined = combined[FINAL_COLS_B]
+    log(f"Pipeline B: {len(combined):,} rows")
+    return combined
+
+
+# ===========================================================================
+# COMBINER
+# ===========================================================================
+def combine_a_b(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
+    """
+    Stack A and B vertically. The union of columns is FINAL_COLS_A
+    (which is FINAL_COLS_B + 'ns_name'). B will get ns_name = None.
+    """
+    union_cols = FINAL_COLS_A  # has ns_name
+    for col in union_cols:
+        if col not in a.columns:
+            a[col] = None
+        if col not in b.columns:
+            b[col] = None
+    a = a[union_cols]
+    b = b[union_cols]
+    return pd.concat([a, b], axis=0, ignore_index=True)
+
+
+# ===========================================================================
+# GUI
+# ===========================================================================
+FILE_FIELDS = [
+    ("invest",      "1-invest (asosiy) CSV",   "csv"),
+    ("korxona",     "1-korxona CSV",           "csv"),
+    ("notijorat",   "1-notijorat CSV",         "csv"),
+    ("nnt",         "1-nnt CSV",               "csv"),
+    ("fx",          "1-fx CSV",                "csv"),
+    ("nnt_katalog", "katalog for nnt (xlsx)",  "xlsx"),
+    ("fx_katalog",  "katalog for fx (xlsx)",   "xlsx"),
+]
+
+DEFAULT_NAMES = {
+    "invest":      "1-invest (asosiy) shakli_Yillik_1700.csv",
+    "korxona":     "1 korxona shakli_Yillik.csv",
+    "notijorat":   "1-notijorat shakli_Yillik_1700.csv",
+    "nnt":         "1- nnt shakli_Yillik_1700.csv",
+    "fx":          "1-fx shakli_Yillik_1700.csv",
+    "nnt_katalog": "katalog for nnt.xlsx",
+    "fx_katalog":  "katalog for fx.xlsx",
+}
+
+
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Yillik Hisobot")
+        self.geometry("900x720")
+        self.minsize(720, 560)
+        self.configure(fg_color=BG_MAIN)
+
+        # Layout grid: header / files card / output card / log / footer
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(3, weight=1)
+
+        self._build_header()
+        self._build_files_card()
+        self._build_output_card()
+        self._build_log_area()
+        self._build_footer()
+
+        self.path_vars: dict[str, ctk.StringVar] = {}
+        self._populate_file_rows()
+        self._auto_detect_in_cwd()
+
+    # ---------- header ----------
+    def _build_header(self):
+        bar = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=10,
+                           border_width=1, border_color=BORDER, height=70)
+        bar.grid(row=0, column=0, padx=16, pady=(16, 8), sticky="ew")
+        bar.grid_propagate(False)
+        bar.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(bar, text="Yillik 1700 — Combiner",
+                     text_color=TEXT_DARK,
+                     font=ctk.CTkFont(size=20, weight="bold")
+                     ).grid(row=0, column=0, padx=20, pady=(14, 0), sticky="w")
+        ctk.CTkLabel(bar,
+                     text="Pick all input files, then run. One Excel file is produced.",
+                     text_color=TEXT_MUTED,
+                     font=ctk.CTkFont(size=12)
+                     ).grid(row=1, column=0, padx=20, pady=(2, 12), sticky="w")
+
+    # ---------- files card ----------
+    def _build_files_card(self):
+        card = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=10,
+                            border_width=1, border_color=BORDER)
+        card.grid(row=1, column=0, padx=16, pady=8, sticky="ew")
+        card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(card, text="Input files",
+                     text_color=TEXT_DARK,
+                     font=ctk.CTkFont(size=14, weight="bold")
+                     ).grid(row=0, column=0, padx=16, pady=(12, 6), sticky="w")
+        self.files_inner = ctk.CTkFrame(card, fg_color=BG_CARD)
+        self.files_inner.grid(row=1, column=0, padx=10, pady=(0, 12), sticky="ew")
+        self.files_inner.grid_columnconfigure(1, weight=1)
+
+    def _populate_file_rows(self):
+        for i, (key, label, ext) in enumerate(FILE_FIELDS):
+            ctk.CTkLabel(self.files_inner, text=label,
+                         text_color=TEXT_DARK, anchor="w", width=200,
+                         font=ctk.CTkFont(size=12)
+                         ).grid(row=i, column=0, padx=(8, 6), pady=4, sticky="w")
+            var = ctk.StringVar(value="")
+            self.path_vars[key] = var
+            entry = ctk.CTkEntry(self.files_inner, textvariable=var,
+                                 fg_color="#FFFFFF", text_color=TEXT_DARK,
+                                 border_color=BORDER, border_width=1, height=30)
+            entry.grid(row=i, column=1, padx=6, pady=4, sticky="ew")
+            ctk.CTkButton(self.files_inner, text="Browse",
+                          width=80, height=30,
+                          fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                          text_color="#FFFFFF",
+                          command=lambda k=key, e=ext: self._browse(k, e)
+                          ).grid(row=i, column=2, padx=(6, 8), pady=4)
+
+    def _browse(self, key: str, ext: str):
+        if ext == "csv":
+            ftypes = [("CSV files", "*.csv"), ("All files", "*.*")]
+        else:
+            ftypes = [("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
+        path = filedialog.askopenfilename(title=f"Select {key}", filetypes=ftypes)
+        if path:
+            self.path_vars[key].set(path)
+
+    def _auto_detect_in_cwd(self):
+        """Auto-fill any default-named file that's already in cwd."""
+        cwd = Path.cwd()
+        for key, name in DEFAULT_NAMES.items():
+            p = cwd / name
+            if p.exists():
+                self.path_vars[key].set(str(p))
+
+    # ---------- output card ----------
+    def _build_output_card(self):
+        card = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=10,
+                            border_width=1, border_color=BORDER)
+        card.grid(row=2, column=0, padx=16, pady=8, sticky="ew")
+        card.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(card, text="Output file",
+                     text_color=TEXT_DARK,
+                     font=ctk.CTkFont(size=14, weight="bold")
+                     ).grid(row=0, column=0, columnspan=3,
+                            padx=16, pady=(12, 6), sticky="w")
+        ctk.CTkLabel(card, text="Save as", text_color=TEXT_DARK, width=80,
+                     font=ctk.CTkFont(size=12)
+                     ).grid(row=1, column=0, padx=(16, 6), pady=(0, 12), sticky="w")
+        self.output_var = ctk.StringVar(value=str(Path.cwd() / "all_combined_final.xlsx"))
+        ctk.CTkEntry(card, textvariable=self.output_var,
+                     fg_color="#FFFFFF", text_color=TEXT_DARK,
+                     border_color=BORDER, border_width=1, height=30
+                     ).grid(row=1, column=1, padx=6, pady=(0, 12), sticky="ew")
+        ctk.CTkButton(card, text="Browse", width=80, height=30,
+                      fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      text_color="#FFFFFF", command=self._browse_output
+                      ).grid(row=1, column=2, padx=(6, 16), pady=(0, 12))
+
+    def _browse_output(self):
+        path = filedialog.asksaveasfilename(
+            title="Save combined file as",
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx")],
+            initialfile="all_combined_final.xlsx",
+        )
+        if path:
+            self.output_var.set(path)
+
+    # ---------- log ----------
+    def _build_log_area(self):
+        card = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=10,
+                            border_width=1, border_color=BORDER)
+        card.grid(row=3, column=0, padx=16, pady=8, sticky="nsew")
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(card, text="Log",
+                     text_color=TEXT_DARK,
+                     font=ctk.CTkFont(size=14, weight="bold")
+                     ).grid(row=0, column=0, padx=16, pady=(12, 6), sticky="w")
+        self.log_box = ctk.CTkTextbox(card, fg_color="#FAFAFA",
+                                      text_color=TEXT_DARK,
+                                      border_color=BORDER, border_width=1,
+                                      font=ctk.CTkFont(family="Menlo", size=11))
+        self.log_box.grid(row=1, column=0, padx=12, pady=(0, 12), sticky="nsew")
+        self.log_box.configure(state="disabled")
+
+    def _log(self, msg: str):
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", msg + "\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+        self.update_idletasks()
+
+    # ---------- footer ----------
+    def _build_footer(self):
+        bar = ctk.CTkFrame(self, fg_color=BG_MAIN)
+        bar.grid(row=4, column=0, padx=16, pady=(8, 16), sticky="ew")
+        bar.grid_columnconfigure(0, weight=1)
+        self.status_label = ctk.CTkLabel(bar, text="Ready.",
+                                         text_color=TEXT_MUTED,
+                                         font=ctk.CTkFont(size=12), anchor="w")
+        self.status_label.grid(row=0, column=0, sticky="w", padx=4)
+        self.run_btn = ctk.CTkButton(bar, text="Run & Combine",
+                                     width=160, height=38,
+                                     fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                                     text_color="#FFFFFF",
+                                     font=ctk.CTkFont(size=13, weight="bold"),
+                                     command=self._on_run)
+        self.run_btn.grid(row=0, column=1, padx=4)
+
+    def _set_status(self, text: str, color: str = TEXT_MUTED):
+        self.status_label.configure(text=text, text_color=color)
+
+    # ---------- run ----------
+    def _on_run(self):
+        # validate inputs
+        missing = []
+        paths: dict[str, Path] = {}
+        for key, label, _ in FILE_FIELDS:
+            raw = self.path_vars[key].get().strip()
+            if not raw:
+                missing.append(label)
+                continue
+            p = Path(raw)
+            if not p.exists():
+                missing.append(f"{label} (file not found)")
+                continue
+            paths[key] = p
+        out = self.output_var.get().strip()
+        if not out:
+            missing.append("Output path")
+        if missing:
+            messagebox.showerror("Missing inputs", "Please fix:\n- " + "\n- ".join(missing))
+            return
+        out_path = Path(out)
+
+        self.run_btn.configure(state="disabled")
+        self._set_status("Running...", ACCENT)
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+
+        threading.Thread(target=self._run_worker, args=(paths, out_path),
+                         daemon=True).start()
+
+    def _run_worker(self, paths: dict[str, Path], out_path: Path):
+        try:
+            df_a = run_pipeline_a(paths, self._log)
+            df_b = run_pipeline_b(paths, self._log)
+            self._log("\n=== Concatenating A + B ===")
+            combined = combine_a_b(df_a, df_b)
+            self._log(f"Combined rows: {len(combined):,}  cols: {len(combined.columns)}")
+
+            self._log(f"\nWriting {out_path} ...")
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
+                combined.to_excel(xw, sheet_name="all_combined", index=False)
+
+            self._log("Done.")
+            self.after(0, lambda: self._set_status(
+                f"Saved {out_path.name}  ({len(combined):,} rows)", GREEN_OK))
+            self.after(0, lambda: messagebox.showinfo(
+                "Done", f"Combined file saved:\n{out_path}\n\nRows: {len(combined):,}"))
+        except Exception as e:
+            tb = traceback.format_exc()
+            self._log("\nERROR:\n" + tb)
+            self.after(0, lambda: self._set_status(f"Error: {e}", RED_ERR))
+            self.after(0, lambda: messagebox.showerror("Error", str(e)))
+        finally:
+            self.after(0, lambda: self.run_btn.configure(state="normal"))
+
+
+def main():
+    app = App()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
