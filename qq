@@ -1,0 +1,39 @@
+from pathlib import Path
+import pandas as pd
+
+# Files
+INPUT_FILE = Path("1-invest (asosiy) shakli_Yillik_1700.csv")
+OUTPUT_FILE = Path("1-invest.xlsx")
+
+# Read CSV file
+df = pd.read_csv(
+    INPUT_FILE,
+    sep=";",
+    index_col=False,
+    low_memory=False
+)
+
+# Show column names
+print("Column Names:")
+print(df.columns.tolist())
+
+# Show first rows
+print("\nFirst 5 Rows:")
+print(df.head())
+
+# Convert columns to numeric
+df["section"] = pd.to_numeric(df["section"], errors="coerce")
+
+
+# Apply filter logic
+filtered_df = df[
+    (df["section"] == 3)
+]
+
+
+# Save to Excel
+filtered_df.to_excel(OUTPUT_FILE, index=False)
+
+print("\nDone.")
+print("Output saved to:", OUTPUT_FILE)
+print("Rows in output:", len(filtered_df))
