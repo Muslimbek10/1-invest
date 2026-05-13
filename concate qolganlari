@@ -1,0 +1,527 @@
+"""
+Combined pipeline — runs all 6 source pipelines in memory and stacks the
+results into a single Excel sheet.
+
+Inputs:
+  - 1-fx shakli_Yillik_1700.csv
+  - 1- nnt shakli_Yillik_1700.csv
+  - 1-notijorat shakli_Yillik_1700.csv
+  - katalog for fx.xlsx
+  - katalog for nnt.xlsx
+
+Output:
+  - combined_output.xlsx   (single sheet 'all_blocks', all rows stacked)
+
+Pipelines (each produces the standard 25-column FINAL_COLS layout):
+
+  Step1 family (ns 301-310, razdel comes from source section):
+    1. fx          (section 26 -> 3, 10 blocks, tur='1-fx')
+    2. nnt         (section  8 -> 3, 10 blocks, tur='1-nnt')
+    3. notijorat   (section  7 -> 3, 10 blocks, tur='1-notijorat')
+
+  Step4 family (ns 402-413, razdel = 4):
+    4. fx          (section 26 -> 3, 11 blocks, tur='1-fx')
+    5. nnt         (section  8 -> 3, 11 blocks, tur='1-nnt')
+    6. notijorat   (section  7 -> 3, 11 blocks, tur='1-notijorat')
+
+Run:  python combined_pipeline.py
+"""
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+
+# ===========================================================================
+# Config — file paths
+# ===========================================================================
+FX_CSV          = Path("1-fx shakli_Yillik_1700.csv")
+NNT_CSV         = Path("1- nnt shakli_Yillik_1700.csv")
+NOTIJORAT_CSV   = Path("1-notijorat shakli_Yillik_1700.csv")
+KATALOG_FX_XLS  = Path("katalog for fx.xlsx")
+KATALOG_NNT_XLS = Path("katalog for nnt.xlsx")
+
+OUTPUT_FILE  = Path("mmmsndnd.xlsx")
+OUTPUT_SHEET = "all_blocks"
+
+
+# ===========================================================================
+# Config — shared layouts
+# ===========================================================================
+# 19-column intermediate layout (used by fx, nnt, notijorat adjust stages)
+ADJUST_COLS = [
+    "inn", "soato", "okpo", "section",
+    "g1", "g2", "g3", "g4", "g5",
+    "g6", "g7", "g8", "g9", "g10",
+    "g11", "g12", "g13", "g14",
+    "tur",
+]
+
+# Final 25-column output layout
+FINAL_COLS = [
+    "davr", "okpo", "razdel", "ns_name", "SOATO", "country", "OKED",
+    "ns", "ns1", "EdIzm",
+    "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "g9", "g10",
+    "npah", "kurs", "ehud", "akt", "tur",
+]
+
+# Columns the step4-style block stage tries to keep
+KEEP_COLS_STEP4 = [
+    "inn", "soato", "okpo", "section",
+    "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8",
+    "g9", "g10", "g11", "g12", "g13", "g14", "g15",
+    "g16", "g17", "g18",
+]
+
+
+# ===========================================================================
+# Config — block definitions
+# ===========================================================================
+# Step1 blocks (10): filter by g1, sum g12, target ns 301-310
+BLOCKS_STEP1 = [
+    {"filter_values": [11],                                       "soato_col": "g9",    "target_ns": 301},
+    {"filter_values": [21],                                       "soato_col": "soato", "target_ns": 302},
+    {"filter_values": [22],                                       "soato_col": "soato", "target_ns": 303},
+    {"filter_values": [31, 32, 33],                               "soato_col": "soato", "target_ns": 304},
+    {"filter_values": [311, 321, 331],                            "soato_col": "soato", "target_ns": 305},
+    {"filter_values": [31],                                       "soato_col": "soato", "target_ns": 306},
+    {"filter_values": [32],                                       "soato_col": "soato", "target_ns": 307},
+    {"filter_values": [33],                                       "soato_col": "soato", "target_ns": 308},
+    {"filter_values": [332],                                      "soato_col": "soato", "target_ns": 309},
+    {"filter_values": [23, 51, 52, 60, 71, 72, 73, 74, 79, 80],   "soato_col": "soato", "target_ns": 310},
+]
+
+# Step4 blocks (11): filter by (section, g1), sum sum_col, target razdel=4, ns 402-413
+BLOCKS_STEP4 = [
+    {"name": "k1",  "section": 3, "g1": 80, "razdel_to": 4, "ns_to": 402, "sum_col": "g16"},
+    {"name": "k2",  "section": 3, "g1": 80, "razdel_to": 4, "ns_to": 403, "sum_col": "g17"},
+    {"name": "k3",  "section": 3, "g1": 51, "razdel_to": 4, "ns_to": 404},
+    {"name": "k4",  "section": 3, "g1": 52, "razdel_to": 4, "ns_to": 405},
+    {"name": "k5",  "section": 3, "g1": 23, "razdel_to": 4, "ns_to": 407},
+    {"name": "k6",  "section": 3, "g1": 60, "razdel_to": 4, "ns_to": 408},
+    {"name": "k7",  "section": 3, "g1": 73, "razdel_to": 4, "ns_to": 409},
+    {"name": "k8",  "section": 3, "g1": 74, "razdel_to": 4, "ns_to": 410},
+    {"name": "k9",  "section": 3, "g1": 71, "razdel_to": 4, "ns_to": 411},
+    {"name": "k10", "section": 3, "g1": 72, "razdel_to": 4, "ns_to": 412},
+    {"name": "k11", "section": 3, "g1": 79, "razdel_to": 4, "ns_to": 413},
+]
+
+
+# ===========================================================================
+# Key normalization helpers (used by fx adjust)
+# ===========================================================================
+def clean_key(s: pd.Series) -> pd.Series:
+    """Strip whitespace, remove trailing .0, normalize null markers."""
+    return (
+        s.astype(str)
+         .str.strip()
+         .str.replace(r"\.0+$", "", regex=True)
+         .replace({"nan": "", "None": "", "<NA>": ""})
+    )
+
+
+def clean_okpo(s: pd.Series) -> pd.Series:
+    """OKPO: clean + strip leading zeros (05943232 -> 5943232)."""
+    return clean_key(s).str.lstrip("0")
+
+
+# ===========================================================================
+# Adjust stages — one per source (return DataFrame in ADJUST_COLS layout)
+# ===========================================================================
+def adjust_fx(csv_path: Path, katalog_path: Path) -> pd.DataFrame:
+    """Build adjusted fx DataFrame: section 26 -> 3, columns reshaped, g7 filled from katalog."""
+    print(f"[fx] Reading {csv_path} ...")
+    df = pd.read_csv(csv_path, sep=";", index_col=False, low_memory=False, dtype=str)
+    print(f"  raw rows: {len(df):,}")
+
+    df["section"] = pd.to_numeric(df["section"], errors="coerce")
+    df = df[df["section"] == 26].copy()
+    print(f"  rows after section==26 filter: {len(df):,}")
+
+    df["inn"]  = clean_key(df["inn"])
+    df["okpo"] = clean_okpo(df["okpo"])
+
+    df["tur"] = "1-fx"
+    df = df[[
+        "inn", "soato", "okpo", "section",
+        "g1", "g2", "g3", "g4", "g5",
+        "g6", "g7", "g8", "g9", "g10",
+        "tur",
+    ]].copy()
+
+    # Reshape g-columns
+    orig = df.copy()
+    df["g2"], df["g3"] = df["g3"].copy(), df["g2"].copy()
+    df["g6"] = 0
+    df["g7"] = 0
+    df["g8"] = 0
+    df["g9"] = df["soato"].astype(str).str[:7]
+    df["g10"] = orig["g6"]
+    df["g11"] = orig["g7"]
+    df["g12"] = orig["g8"]
+    df["g13"] = orig["g9"]
+    df["g14"] = orig["g10"]
+    df = df[ADJUST_COLS].copy()
+
+    # Katalog merge + g7 fallback
+    print(f"[fx] Reading {katalog_path} ...")
+    sec = pd.read_excel(katalog_path, dtype=str)
+    sec["INN"]  = clean_key(sec["INN"])
+    sec["OKPO"] = clean_okpo(sec["OKPO"])
+
+    df = df.merge(sec, left_on=["inn", "okpo"], right_on=["INN", "OKPO"], how="left")
+
+    for col in ["2_xona", "4_xona", "5_xona"]:
+        if col not in df.columns:
+            df[col] = pd.NA
+        df[col] = (
+            df[col].astype(str).str.strip()
+            .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+        )
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["g7"] = df["2_xona"]
+    df["g7"] = df["g7"].fillna(df["4_xona"])
+    df["g7"] = df["g7"].fillna(df["5_xona"])
+    df["g7"] = df["g7"].fillna(0)
+
+    df.loc[df["section"] == 26, "section"] = 3
+    df = df[ADJUST_COLS].copy()
+    print(f"[fx] adjusted rows: {len(df):,}")
+    return df
+
+
+def adjust_nnt(csv_path: Path, katalog_path: Path) -> pd.DataFrame:
+    """Build adjusted nnt DataFrame: section 8 -> 3, columns reshaped, g7 filled from katalog."""
+    print(f"[nnt] Reading {csv_path} ...")
+    df = pd.read_csv(csv_path, sep=";", index_col=False, low_memory=False)
+    print(f"  raw rows: {len(df):,}")
+
+    df["section"] = pd.to_numeric(df["section"], errors="coerce")
+    df = df[df["section"] == 8].copy()
+    print(f"  rows after section==8 filter: {len(df):,}")
+
+    df["tur"] = "1-nnt"
+    df = df[[
+        "inn", "soato", "okpo", "section",
+        "g1", "g2", "g3", "g4", "g5",
+        "g6", "g7", "g8", "g9", "g10",
+        "tur",
+    ]].copy()
+
+    # Reshape g-columns
+    orig = df.copy()
+    df["g2"], df["g3"] = orig["g3"], orig["g2"]
+    df["g6"] = 0
+    df["g7"] = 0
+    df["g8"] = 0
+    df["g9"] = df["soato"].astype(str).str[:7]
+    df["g10"] = orig["g6"]
+    df["g11"] = orig["g7"]
+    df["g12"] = orig["g8"]
+    df["g13"] = orig["g9"]
+    df["g14"] = orig["g10"]
+    df = df[ADJUST_COLS].copy()
+
+    # Katalog merge + g7 priority logic
+    print(f"[nnt] Reading {katalog_path} ...")
+    sec = pd.read_excel(katalog_path)
+    df["inn"]   = df["inn"].astype(str)
+    df["okpo"]  = df["okpo"].astype(str)
+    sec["INN"]  = sec["INN"].astype(str)
+    sec["OKPO"] = sec["OKPO"].astype(str)
+
+    df = df.merge(sec, left_on=["inn", "okpo"], right_on=["INN", "OKPO"], how="left")
+
+    for col in ["2_xona", "4_xona", "5_xona"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        else:
+            df[col] = 0
+
+    df["g7"] = (
+        df["2_xona"]
+        .where(df["2_xona"] != 0, df["4_xona"])
+        .where(df["2_xona"] != 0, df["5_xona"])
+    ).fillna(0)
+
+    df.loc[df["section"] == 8, "section"] = 3
+
+    # Force dtypes
+    for col in ["g6", "g7", "g8", "g10", "g11", "g12", "g13", "g14"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    for col in ["inn", "soato", "okpo", "g9", "tur"]:
+        df[col] = df[col].astype(str).replace({"nan": "", "None": ""})
+
+    df = df[ADJUST_COLS].copy()
+    print(f"[nnt] adjusted rows: {len(df):,}")
+    return df
+
+
+def adjust_notijorat(csv_path: Path) -> pd.DataFrame:
+    """Build adjusted notijorat DataFrame: section 7 -> 3, g4 remap (10->11, 11->13)."""
+    print(f"[notijorat] Reading {csv_path} ...")
+    df = pd.read_csv(
+        csv_path,
+        sep=";",
+        on_bad_lines="skip",
+        encoding="utf-8",
+        index_col=False,
+        low_memory=False,
+    )
+    print(f"  raw rows: {len(df):,}")
+
+    df["section"] = pd.to_numeric(df["section"], errors="coerce")
+    df["g4"]      = pd.to_numeric(df["g4"], errors="coerce")
+    df = df[df["section"] == 7].copy()
+    print(f"  rows after section==7 filter: {len(df):,}")
+
+    df["tur"] = "1-notijorat"
+    df.loc[df["section"] == 7, "section"] = 3
+    df["g4"] = df["g4"].replace({10: 11, 11: 13})
+
+    available = [c for c in ADJUST_COLS if c in df.columns]
+    missing = [c for c in ADJUST_COLS if c not in df.columns]
+    if missing:
+        print(f"  NOTE: columns not present in input: {missing}")
+    df = df[available].copy()
+    print(f"[notijorat] adjusted rows: {len(df):,}")
+    return df
+
+
+# ===========================================================================
+# Step1 block runner — groupby [okpo, section, soato_col, g1] sum(g12)
+# ===========================================================================
+def run_step1_block(
+    df: pd.DataFrame,
+    filter_values: list[int],
+    soato_col: str,
+    target_ns: int,
+    tur: str,
+    truncate_soato: bool = False,
+) -> pd.DataFrame:
+    """One step1 block. Returns rows in FINAL_COLS layout.
+
+    truncate_soato=True is the fx variant: cut soato_col to first 7 chars
+    BEFORE grouping. nnt/notijorat don't do that.
+    """
+    if soato_col not in df.columns:
+        return pd.DataFrame(columns=FINAL_COLS)
+
+    sub = df[df["g1"].isin(filter_values)].copy()
+    if sub.empty:
+        return pd.DataFrame(columns=FINAL_COLS)
+
+    if truncate_soato:
+        sub[soato_col] = sub[soato_col].astype(str).str[:7]
+
+    grouped = sub.groupby(
+        ["okpo", "section", soato_col, "g1"],
+        as_index=False,
+    )["g12"].sum()
+
+    grouped = grouped.rename(columns={
+        "section": "razdel",
+        soato_col: "SOATO",
+        "g1":      "ns",
+        "g12":     "g1",
+    })
+
+    grouped["ns"]      = target_ns
+    grouped["ns_name"] = np.nan
+    grouped["tur"]     = tur
+
+    for col in FINAL_COLS:
+        if col not in grouped.columns:
+            grouped[col] = np.nan
+    return grouped[FINAL_COLS]
+
+
+def run_step1_pipeline(
+    adjusted: pd.DataFrame,
+    tur: str,
+    truncate_soato: bool,
+    label: str,
+) -> pd.DataFrame:
+    """Run all 10 step1 blocks on an adjusted DataFrame."""
+    df = adjusted.copy()
+    for col in ("section", "g1", "g12"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df[df["section"] == 3].copy()
+    print(f"[{label}] step1 rows (section==3): {len(df):,}")
+
+    pieces = []
+    for i, block in enumerate(BLOCKS_STEP1, start=1):
+        out = run_step1_block(
+            df,
+            filter_values=block["filter_values"],
+            soato_col=block["soato_col"],
+            target_ns=block["target_ns"],
+            tur=tur,
+            truncate_soato=truncate_soato,
+        )
+        f = block["filter_values"]
+        desc = f"g1 in {f}" if len(f) > 1 else f"g1 == {f[0]}"
+        print(f"  block {i:>2}: {desc:<55} -> ns={block['target_ns']:<4} rows={len(out):,}")
+        pieces.append(out)
+    return pd.concat(pieces, ignore_index=True)
+
+
+# ===========================================================================
+# Step4 block runner — groupby [okpo, SOATO] sum(sum_col)
+# ===========================================================================
+def run_step4_block(
+    df: pd.DataFrame,
+    section: int,
+    g1: int,
+    razdel_to: int,
+    ns_to: int,
+    sum_col: str,
+    tur: str,
+) -> pd.DataFrame:
+    """One step4 block. Returns rows in FINAL_COLS layout."""
+    if sum_col not in df.columns:
+        return pd.DataFrame(columns=FINAL_COLS)
+
+    sub = df[(df["section"] == section) & (df["g1"] == g1)].copy()
+    if sub.empty:
+        return pd.DataFrame(columns=FINAL_COLS)
+
+    sub["SOATO"] = sub["g9"].astype(str).str[:7]
+
+    grouped = (
+        sub.groupby(["okpo", "SOATO"], as_index=False)
+           .agg({"section": "first", "g1": "first", sum_col: "sum"})
+    )
+
+    result = grouped.rename(columns={
+        "section": "razdel",
+        "g1":      "ns",
+        sum_col:   "g1",
+    })
+
+    result["razdel"]  = razdel_to
+    result["ns"]      = ns_to
+    result["ns_name"] = np.nan
+    result["tur"]     = tur
+
+    for col in FINAL_COLS:
+        if col not in result.columns:
+            result[col] = np.nan
+    return result[FINAL_COLS]
+
+
+def run_step4_pipeline(
+    adjusted: pd.DataFrame,
+    tur: str,
+    label: str,
+    materialize_missing_sum_cols: bool = False,
+) -> pd.DataFrame:
+    """Run all 11 step4 blocks on an adjusted DataFrame.
+
+    materialize_missing_sum_cols=True (fx variant): if a block needs g16/g17
+    and the data doesn't have them, fill with 0 so the block still runs
+    (it will just sum to 0). For nnt/notijorat we leave them missing,
+    and run_step4_block returns an empty frame for those blocks.
+    """
+    df = adjusted.copy()
+
+    sum_cols_used = {b.get("sum_col", "g12") for b in BLOCKS_STEP4}
+    for col in {"section", "g1", *sum_cols_used}:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df[df["section"] == 3].copy()
+    print(f"[{label}] step4 rows (section==3): {len(df):,}")
+
+    available = [c for c in KEEP_COLS_STEP4 if c in df.columns]
+    df = df[available].copy()
+
+    if materialize_missing_sum_cols:
+        for col in sum_cols_used:
+            if col not in df.columns:
+                print(f"  NOTE: sum column '{col}' missing — filling with 0")
+                df[col] = 0
+
+    pieces = []
+    for block in BLOCKS_STEP4:
+        sum_col = block.get("sum_col", "g12")
+        out = run_step4_block(
+            df,
+            section=block["section"],
+            g1=block["g1"],
+            razdel_to=block["razdel_to"],
+            ns_to=block["ns_to"],
+            sum_col=sum_col,
+            tur=tur,
+        )
+        print(
+            f"  {block['name']:<4} section={block['section']} g1={block['g1']:<3} "
+            f"-> razdel={block['razdel_to']} ns={block['ns_to']:<4} "
+            f"sum={sum_col:<4} rows={len(out):,}"
+        )
+        pieces.append(out)
+    return pd.concat(pieces, ignore_index=True)
+
+
+# ===========================================================================
+# Main
+# ===========================================================================
+def main() -> None:
+    print("=" * 70)
+    print("Building adjusted DataFrames (one per source) ...")
+    print("=" * 70)
+    fx_adj        = adjust_fx(FX_CSV, KATALOG_FX_XLS)
+    nnt_adj       = adjust_nnt(NNT_CSV, KATALOG_NNT_XLS)
+    notijorat_adj = adjust_notijorat(NOTIJORAT_CSV)
+
+    all_pieces: list[pd.DataFrame] = []
+
+    # ---- Step1 family (ns 301-310) --------------------------------------
+    print()
+    print("=" * 70)
+    print("STEP1 FAMILY (ns 301-310)")
+    print("=" * 70)
+
+    print("\n--- fx (step1, tur='1-fx', truncate SOATO to 7 chars) ---")
+    all_pieces.append(run_step1_pipeline(fx_adj, tur="1-fx", truncate_soato=True, label="fx"))
+
+    print("\n--- nnt (step1, tur='1-nnt') ---")
+    all_pieces.append(run_step1_pipeline(nnt_adj, tur="1-nnt", truncate_soato=False, label="nnt"))
+
+    print("\n--- notijorat (step1, tur='1-notijorat') ---")
+    all_pieces.append(run_step1_pipeline(notijorat_adj, tur="1-notijorat", truncate_soato=False, label="notijorat"))
+
+    # ---- Step4 family (ns 402-413) --------------------------------------
+    print()
+    print("=" * 70)
+    print("STEP4 FAMILY (ns 402-413)")
+    print("=" * 70)
+
+    print("\n--- fx (step4, tur='1-fx', g16/g17 materialized as 0) ---")
+    all_pieces.append(run_step4_pipeline(fx_adj, tur="1-fx", label="fx", materialize_missing_sum_cols=True))
+
+    print("\n--- nnt (step4, tur='1-nnt') ---")
+    all_pieces.append(run_step4_pipeline(nnt_adj, tur="1-nnt", label="nnt"))
+
+    print("\n--- notijorat (step4, tur='1-notijorat') ---")
+    all_pieces.append(run_step4_pipeline(notijorat_adj, tur="1-notijorat", label="notijorat"))
+
+    # ---- Combine + write ------------------------------------------------
+    final = pd.concat(all_pieces, ignore_index=True)
+    print()
+    print("=" * 70)
+    print(f"Combined: {len(final):,} rows / {len(final.columns)} cols")
+    print("Rows by tur:")
+    print(final["tur"].value_counts().to_string())
+    print("=" * 70)
+
+    print(f"\nWriting {OUTPUT_FILE} ...")
+    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as xw:
+        final.to_excel(xw, sheet_name=OUTPUT_SHEET, index=False)
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
